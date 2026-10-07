@@ -18,5 +18,5 @@ TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
 python ${SCRIPT_DIR}/../main.py \
   --disable-mmap \
   --disable-smart-memory \
-  --use-pytorch-cross-attention  \
+  --use-ck-attention  \
   --cache-none
