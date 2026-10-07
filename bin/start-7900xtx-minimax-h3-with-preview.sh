@@ -20,4 +20,5 @@ python ${SCRIPT_DIR}/../main.py \
   --disable-mmap \
   --disable-smart-memory \
   --use-ck-attention  \
+  --preview-method taesd \
   --cache-none
