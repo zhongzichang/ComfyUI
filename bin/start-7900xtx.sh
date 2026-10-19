@@ -11,6 +11,8 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 #  --use-sage-attention 可以在画质毫无损失的前提下提高 2~4 倍的速度，适合 CUDA
 #  --use-ck-attention 是新版 ComfyUI 专门为 AMD ROCm 引入的内核优化，能极大减少 Prompt 的前推时间
 #  --fp32-vae 这个全局参数会将视频 VAE 也强制拉回 FP32 运行，这会导致视频解码阶段变得极其漫长
+HSA_OVERRIDE_GFX_VERSION=11.0.0 \
+PINTO_DISABLE_NNPACK=1 \
 AITER_TRITON_ONLY=1 \
 COMFYUI_ENABLE_MIOPEN=1 \
 FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
