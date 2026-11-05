@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # comfyui-tailscale.sh —— 管理走 Tailscale 的 ComfyUI 实例（后台运行 + 自检）
 #
-# 用法: comfyui-tailscale.sh [start|stop|restart|status|url|logs [-n N]]
+# 用法: comfyui-tailscale.sh [start|stop|restart|status|url|probe|logs [-n N]]
 #
-#   start     后台启动 bin/start-7900xtx-tailscale.sh，输出进
-#             logs/comfyui_tailscale_<port>.log；轮到 HTTP 真的应答才返回，
+#   start     后台启动启动脚本——默认 bin/start-7900xtx-tailscale.sh，用
+#             COMFY_STARTER 换（跑 H3 用 start-7900xtx-tailscale-h3.sh）；输出进
+#             logs/comfyui_tailscale_<port>.log，轮到 HTTP 真的应答才返回，
 #             然后打印节点实际要访问的地址
 #   stop      直接交给 bin/stop-comfyui.sh（TERM → 最多 15s → KILL，再验端口）
 #   restart   stop 之后 start
-#   status    进程、监听地址、Tailscale 地址、每个 URL 的 HTTP 状态码
+#   status    进程、监听地址、锁页上限、Tailscale 地址、每个 URL 的 HTTP 状态码
 #   url       只打印节点用的地址（Tailscale 机器名与 100.64/10 地址）
+#   probe     最小显存自检：空闲量 + 一次 40 KB 分配（十几秒，实例在跑也安全）
 #   logs      tail -f 日志；logs -n 200 先给 200 行再跟随
 #
-# 监听地址只由 start-7900xtx-tailscale.sh 决定：回环加 Tailscale 自己的
-# 100.64/10 与 fd7a::/64，不含局域网 192.168.1.x（那是 start-7900xtx-v2.sh）。
+# 监听地址只由启动脚本决定（默认 start-7900xtx-tailscale.sh，H3 版同规则）：
+# 回环加 Tailscale 自己的 100.64/10 与 fd7a::/64，不含局域网 192.168.1.x
+#（那是 start-7900xtx-v2.sh）。
 # ComfyUI 本身没有任何认证，所以可访问范围就等于 Tailscale 网络本身的安全
 # 范围；status/url 把这份范围如实打出来，不做假象。
 #
-# 环境变量: COMFY_PORT（默认 8188）
+# 环境变量: COMFY_PORT（默认 8188）、COMFY_STARTER（换启动脚本，绝对路径）
 set -uo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
@@ -25,7 +28,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
 . "${script_dir}/comfyui-pids.sh"   # 进程发现只有这一份，与 stop-comfyui.sh 共用
 
 PORT="${COMFY_PORT:-8188}"
-starter="${script_dir}/start-7900xtx-tailscale.sh"
+# 启动脚本可换：H3 那套权重要抬锁页、不带 --cache-none，有专门的启动脚本
+starter="${COMFY_STARTER:-${script_dir}/start-7900xtx-tailscale.sh}"
 stopper="${script_dir}/stop-comfyui.sh"
 log_dir="${COMFY_ROOT}/logs"
 log="${log_dir}/comfyui_tailscale_${PORT}.log"
@@ -35,6 +39,16 @@ usage() { sed -ne '2,/^set -uo/p' "$0" | sed -ne '/^#/p'; }
 die() { echo "ERROR: $*" >&2; exit 2; }
 
 listening() { ss -ltn 2>/dev/null | grep -q "[:.]${PORT} "; }
+
+# 锁页上限。systemd 给 user 会话的 LimitMEMLOCK 只有 7.84 GB，而 H3 的文本编码器
+# 单文件 13.9 GB：单次超过这个额度的锁页分配在 ROCm 上返回 hipErrorOutOfMemory，
+# 报错长得和显存不够一模一样。所以 status 里要有这一行。
+memlock_line() {
+  local l
+  l=$(ulimit -l 2>/dev/null)
+  if [ "${l}" = "unlimited" ]; then echo "unlimited"
+  else echo "$((l / 1024)) MB（单次锁页分配超过它就会报成 out of memory）"; fi
+}
 
 # 地址只认 tailscale 命令行；它不给就直说给不了，不从 ss 的输出里猜一个。
 ts_ipv4() { command -v tailscale >/dev/null 2>&1 && tailscale ip -4 2>/dev/null | head -n1; }
@@ -67,7 +81,16 @@ do_start() {
   # 节点那边真能用。300s 覆盖首次加载模型/工作流的时间。
   for i in $(seq 1 300); do
     code=$(http_code "http://127.0.0.1:${PORT}/" 5)
-    if [ "${code}" = 000 ]; then sleep 1; continue; fi
+    if [ "${code}" = 000 ]; then
+      # 启动脚本自己退出（H3 版的显存自检没过就是 exit 3）时不必等满 300s：
+      # 没有 python 在跑、启动脚本也不在了，就是死了，直接把日志尾巴交出来。
+      if [ "${i}" -gt 15 ] && [ -z "$(find_pids)" ] && ! pgrep -f "${starter}" >/dev/null 2>&1; then
+        echo "WARN: 启动脚本已退出，见 ${log}" >&2
+        tail -n 20 "${log}" 2>/dev/null | sed -e 's/^/  /'
+        return 1
+      fi
+      sleep 1; continue
+    fi
     echo "ready = ${i}s 后 http://127.0.0.1:${PORT}/ 应答 ${code}"
     # 进程是刚刚才出现的，启动前查的那一份是空的，这里重查一次。
     pids=$(find_pids | tr '\n' ' '); pids=${pids% }
@@ -95,6 +118,7 @@ do_status() {
   elif listening; then echo "state = 端口被本脚本认不出的进程占着"
   else echo "state = stopped"; fi
   echo "port = ${PORT}"
+  echo "memlock = $(memlock_line)"
   if [ -n "${ip}${dns}" ]; then
     echo "tailscale = ${dns:-无机器名} ${ip:+($ip)}"
   else
@@ -117,6 +141,38 @@ do_status() {
     done
   fi
   echo "log = ${log}（logs 跟随，logs -n 200 取一段）"
+  echo "probe = 卡是活的吗：跑一次 probe（十几秒，实例在跑也安全）"
+}
+
+# 显存空着不等于卡是好的。睡眠/唤醒之后 amdgpu 复位过，40 KB 都分配不了，报出来
+# 是 hipErrorOutOfMemory，长得和显存不够一模一样（comfy/model_management.py:515
+# 启动时探测 flash attention 用的就是 40 KB，那次的 OOM 是这条路径）。
+# 只做最小探测：空闲量加一次 40 KB 分配，不碰大内存，实例在跑也安全。
+do_probe() {
+  local py
+  py="${COMFY_ROOT}/venv/bin/python"
+  [ -x "${py}" ] || py=$(command -v python3)
+  [ -x "${py}" ] || { echo "没有可用的 python，探不了"; return 2; }
+  echo "memlock = $(memlock_line)"
+  timeout 180 "${py}" - <<'PYEOF'
+try:
+    import torch
+    free, total = torch.cuda.mem_get_info(0)
+    print("vram = 空闲 %.2f / %.2f GB" % (free / 2**30, total / 2**30))
+except Exception as e:
+    print("vram = 读不到：%s: %s" % (type(e).__name__, str(e).splitlines()[0]))
+    raise SystemExit(2)
+try:
+    torch.zeros((1, 1, 8, 64), dtype=torch.float16, device="cuda")
+    torch.cuda.synchronize()
+    torch.zeros(1, device="cuda").add_(1).item()
+    print("alloc = 40 KB 分配通过，计算路径可用")
+except Exception as e:
+    print("alloc = 失败：%s" % str(e).splitlines()[0])
+    print("alloc = 上面那行空闲显存是够的，所以这条失败是设备状态坏了：睡眠/唤醒后 "
+          "amdgpu 复位过，重启机器（或重载 amdgpu）再试")
+    raise SystemExit(1)
+PYEOF
 }
 
 do_url() {
@@ -151,6 +207,7 @@ case "${1:-status}" in
   restart) do_stop && do_start ;;
   status)  do_status ;;
   url)     do_url ;;
+  probe)   do_probe ;;
   logs)    do_logs "$@" ;;
   -h|--help|help) usage ;;
   *)       usage; exit 2 ;;
